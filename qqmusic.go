@@ -16,12 +16,39 @@ const qqMusicU = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 
 // qqFile 描述某首歌各音质是否可用(字节数>0 表示该音质存在).
 type qqFile struct {
-	MediaMid  string `json:"media_mid"`
-	SizeFlac  int64  `json:"size_flac"`
-	SizeHires int64  `json:"size_hires"`
-	Size320   int64  `json:"size_320mp3"`
-	Size128   int64  `json:"size_128mp3"`
-	SizeApe   int64  `json:"size_ape"`
+	MediaMid string `json:"media_mid"`
+	// 高解析/臻品系列(从高到低).
+	SizeNew    []int64 `json:"size_new"`     // [0]臻品全景声, [1]臻品母带, [2]臻品音质 等
+	SizeDolby  int64   `json:"size_dolby"`   // 臻品全景声(Dolby Atmos)
+	SizeHires  int64   `json:"size_hires"`   // 臻品母带(Hi-Res 24bit)
+	SizeFlac   int64   `json:"size_flac"`    // 无损 FLAC
+	SizeApe    int64   `json:"size_ape"`     // 无损 APE
+	SizeOgg640 int64   `json:"size_ogg_640"` // 高品加强 OGG 640
+	Size320    int64   `json:"size_320mp3"`  // 320 MP3
+	SizeOgg192 int64   `json:"size_192ogg"`  // 192 OGG
+	Size128    int64   `json:"size_128mp3"`  // 128 MP3
+}
+
+// hiresSize 返回臻品母带(Hi-Res)可用字节数, 兼容 size_hires 与 size_new[1].
+func (f qqFile) hiresSize() int64 {
+	if f.SizeHires > 0 {
+		return f.SizeHires
+	}
+	if len(f.SizeNew) > 1 {
+		return f.SizeNew[1]
+	}
+	return 0
+}
+
+// dolbySize 返回臻品全景声(Dolby)可用字节数, 兼容 size_dolby 与 size_new[0].
+func (f qqFile) dolbySize() int64 {
+	if f.SizeDolby > 0 {
+		return f.SizeDolby
+	}
+	if len(f.SizeNew) > 0 {
+		return f.SizeNew[0]
+	}
+	return 0
 }
 
 // qqTrack QQ 音乐歌曲基础信息.
@@ -32,6 +59,10 @@ type qqTrack struct {
 	Singer []struct {
 		Name string `json:"name"`
 	} `json:"singer"`
+	Album struct {
+		Mid  string `json:"mid"`
+		Name string `json:"name"`
+	} `json:"album"`
 	File qqFile `json:"file"`
 }
 
@@ -144,6 +175,122 @@ func fetchQQPlaylist(disstid, cookie string, logf func(string)) (string, []*Song
 	return r.Req0.Data.Dirinfo.Title, songs, nil
 }
 
+// fetchQQAlbum 获取 QQ 音乐专辑(albumMid)内全部歌曲并填充下载地址.
+func fetchQQAlbum(albumMid, cookie string, logf func(string)) (string, []*Song, error) {
+	if logf == nil {
+		logf = func(string) {}
+	}
+	title := ""
+	songs := make([]*Song, 0, 64)
+	const pageSize = 100
+	for begin := 0; ; begin += pageSize {
+		reqData := fmt.Sprintf(`{"comm":{"ct":24,"cv":0},"req_0":{"module":"music.musichallAlbum.AlbumSongList","method":"GetAlbumSongList","param":{"albumMid":"%s","begin":%d,"num":%d,"order":2}}}`, albumMid, begin, pageSize)
+		body, err := qqMusicuGet(reqData, cookie)
+		if err != nil {
+			return "", nil, err
+		}
+		var r struct {
+			Req0 struct {
+				Code int `json:"code"`
+				Data struct {
+					TotalNum int `json:"totalNum"`
+					SongList []struct {
+						SongInfo qqTrack `json:"songInfo"`
+					} `json:"songList"`
+				} `json:"data"`
+			} `json:"req_0"`
+		}
+		if err := json.Unmarshal(body, &r); err != nil {
+			return "", nil, fmt.Errorf("\u89e3\u6790 QQ \u4e13\u8f91\u5931\u8d25: %v", err)
+		}
+		if r.Req0.Code != 0 {
+			return "", nil, fmt.Errorf("QQ \u4e13\u8f91\u63a5\u53e3\u8fd4\u56de code=%d (albumMid=%s)", r.Req0.Code, albumMid)
+		}
+		list := r.Req0.Data.SongList
+		if len(list) == 0 {
+			break
+		}
+		for _, it := range list {
+			if it.SongInfo.Mid == "" {
+				continue
+			}
+			s := it.SongInfo.toSong()
+			if title == "" && it.SongInfo.Album.Name != "" {
+				title = it.SongInfo.Album.Name
+			}
+			songs = append(songs, s)
+		}
+		if r.Req0.Data.TotalNum > 0 && len(songs) >= r.Req0.Data.TotalNum {
+			break
+		}
+		if len(list) < pageSize {
+			break
+		}
+	}
+	if len(songs) == 0 {
+		return "", nil, fmt.Errorf("\u4e13\u8f91\u4e3a\u7a7a\u6216 ID \u65e0\u6548(albumMid=%s)", albumMid)
+	}
+	if title == "" {
+		title = "\u4e13\u8f91"
+	}
+	fillQQURLs(songs, cookie, logf)
+	return title, songs, nil
+}
+
+// fetchQQSinger 获取 QQ 歌手(singerMid)的热门歌曲(按热度排序), 最多 limit 首.
+func fetchQQSinger(singerMid string, limit int, cookie string, logf func(string)) (string, []*Song, error) {
+	if logf == nil {
+		logf = func(string) {}
+	}
+	if limit <= 0 {
+		limit = 30
+	}
+	reqData := fmt.Sprintf(`{"comm":{"ct":24,"cv":0},"req_0":{"module":"music.web_singer_info_svr","method":"get_singer_detail_info","param":{"sort":5,"singermid":"%s","sin":0,"num":%d}}}`, singerMid, limit)
+	body, err := qqMusicuGet(reqData, cookie)
+	if err != nil {
+		return "", nil, err
+	}
+	var r struct {
+		Req0 struct {
+			Code int `json:"code"`
+			Data struct {
+				SingerInfo struct {
+					Name string `json:"name"`
+				} `json:"singer_info"`
+				Songlist []qqTrack `json:"songlist"`
+			} `json:"data"`
+		} `json:"req_0"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return "", nil, fmt.Errorf("\u89e3\u6790 QQ \u6b4c\u624b\u5931\u8d25: %v", err)
+	}
+	if r.Req0.Code != 0 {
+		return "", nil, fmt.Errorf("QQ \u6b4c\u624b\u63a5\u53e3\u8fd4\u56de code=%d (singerMid=%s)", r.Req0.Code, singerMid)
+	}
+	tracks := r.Req0.Data.Songlist
+	if len(tracks) == 0 {
+		return "", nil, fmt.Errorf("\u6b4c\u624b\u65e0\u70ed\u95e8\u6b4c\u66f2\u6216 ID \u65e0\u6548(singerMid=%s)", singerMid)
+	}
+	if len(tracks) > limit {
+		tracks = tracks[:limit]
+	}
+	songs := make([]*Song, 0, len(tracks))
+	for _, t := range tracks {
+		if t.Mid == "" {
+			continue
+		}
+		songs = append(songs, t.toSong())
+	}
+	title := r.Req0.Data.SingerInfo.Name
+	if title == "" {
+		title = "\u6b4c\u624b\u70ed\u95e8"
+	} else {
+		title = title + " \u70ed\u95e8"
+	}
+	fillQQURLs(songs, cookie, logf)
+	return title, songs, nil
+}
+
 // fetchQQSong 获取 QQ 音乐单曲. id 可为数字 songid 或字母数字 songmid.
 func fetchQQSong(id, cookie string, logf func(string)) ([]*Song, error) {
 	id = strings.TrimSpace(id)
@@ -177,19 +324,28 @@ func fetchQQSong(id, cookie string, logf func(string)) ([]*Song, error) {
 	return songs, nil
 }
 
-// qqQuality 描述一种音质对应的文件名前缀/扩展名/码率.
+// qqQuality 描述一种音质对应的文件名前缀/扩展名/码率/songtype.
 type qqQuality struct {
-	prefix string
-	ext    string
-	br     int // bps, 仅用于展示
-	avail  func(qqFile) bool
+	name     string
+	prefix   string
+	ext      string
+	br       int
+	songtype int
+	avail    func(qqFile) bool
+	size     func(qqFile) int64
 }
 
-// 按优先级从高到低: 无损 > 320 > 128.
+// 按优先级从高到低: 全景声 > 母带 > FLAC > APE > OGG640 > 320 > OGG192 > 128.
+// fillQQURLs 会逐档尝试, 取得 Cookie 权限支持的最高音质.
 var qqQualities = []qqQuality{
-	{"F000", "flac", 999000, func(f qqFile) bool { return f.SizeFlac > 0 }},
-	{"M800", "mp3", 320000, func(f qqFile) bool { return f.Size320 > 0 }},
-	{"M500", "mp3", 128000, func(f qqFile) bool { return f.Size128 > 0 }},
+	{"臻品全景声", "Q000", "flac", 1800000, 14, func(f qqFile) bool { return f.dolbySize() > 0 }, func(f qqFile) int64 { return f.dolbySize() }},
+	{"臻品母带", "RS01", "flac", 2400000, 13, func(f qqFile) bool { return f.hiresSize() > 0 }, func(f qqFile) int64 { return f.hiresSize() }},
+	{"无损FLAC", "F000", "flac", 999000, 0, func(f qqFile) bool { return f.SizeFlac > 0 }, func(f qqFile) int64 { return f.SizeFlac }},
+	{"无损APE", "A000", "ape", 999000, 0, func(f qqFile) bool { return f.SizeApe > 0 }, func(f qqFile) int64 { return f.SizeApe }},
+	{"OGG640", "O600", "ogg", 640000, 0, func(f qqFile) bool { return f.SizeOgg640 > 0 }, func(f qqFile) int64 { return f.SizeOgg640 }},
+	{"320MP3", "M800", "mp3", 320000, 0, func(f qqFile) bool { return f.Size320 > 0 }, func(f qqFile) int64 { return f.Size320 }},
+	{"OGG192", "O400", "ogg", 192000, 0, func(f qqFile) bool { return f.SizeOgg192 > 0 }, func(f qqFile) int64 { return f.SizeOgg192 }},
+	{"128MP3", "M500", "mp3", 128000, 0, func(f qqFile) bool { return f.Size128 > 0 }, func(f qqFile) int64 { return f.Size128 }},
 }
 
 // fillQQURLs 为歌曲批量申请 vkey 并组装下载地址.
@@ -243,7 +399,7 @@ func requestQQVkey(songs []*Song, q qqQuality, guid, uin, cookie string, logf fu
 	filenames := make([]string, len(songs))
 	for i, s := range songs {
 		mids[i] = s.QQMid
-		types[i] = 0
+		types[i] = q.songtype
 		mediaMid := s.qqFile.MediaMid
 		if mediaMid == "" {
 			mediaMid = s.QQMid
@@ -300,6 +456,8 @@ func requestQQVkey(songs []*Song, q qqQuality, guid, uin, cookie string, logf fu
 		songs[i].URL = sip + info.Purl
 		songs[i].Type = q.ext
 		songs[i].Br = q.br
+		songs[i].Size = q.size(songs[i].qqFile)
+		logf(fmt.Sprintf("✓ [%s - %s] 取得音质: %s", songs[i].Name, songs[i].Artist, q.name))
 	}
 }
 

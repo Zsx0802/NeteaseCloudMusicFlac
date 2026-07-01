@@ -50,7 +50,7 @@ func runGUI() {
 	}
 
 	sources := []string{"网易云音乐", "QQ音乐"}
-	kinds := []string{"歌单", "单曲"}
+			kinds := []string{"歌单", "单曲", "专辑", "歌手热门"}
 
 	err := MainWindow{
 		AssignTo:   &mw,
@@ -168,9 +168,14 @@ func startDownload(sourceCB, kindCB *walk.ComboBox, idEdit, cookieEdit *walk.Lin
 		source = SourceNetease
 	}
 	var kind Kind
-	if kindCB.CurrentIndex() == 1 {
+	switch kindCB.CurrentIndex() {
+	case 1:
 		kind = KindSong
-	} else {
+	case 2:
+		kind = KindAlbum
+	case 3:
+		kind = KindSinger
+	default:
 		kind = KindPlaylist
 	}
 	cookie := cookieEdit.Text()

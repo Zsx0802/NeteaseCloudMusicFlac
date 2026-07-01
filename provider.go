@@ -27,6 +27,8 @@ type Kind string
 const (
 	KindPlaylist Kind = "playlist" // 歌单
 	KindSong     Kind = "song"     // 单曲
+	KindAlbum    Kind = "album"    // 专辑
+	KindSinger   Kind = "singer"   // 歌手热门
 )
 
 // fetch 统一调度: 按音源/类型获取歌曲列表(已填好下载地址).
@@ -47,8 +49,13 @@ func fetch(source Source, kind Kind, id, cookie string, logf func(string)) (stri
 		songs, err := fetchNeteaseSong(id, cookie)
 		return "单曲", songs, err
 	case SourceQQ:
-		if kind == KindPlaylist {
+		switch kind {
+		case KindPlaylist:
 			return fetchQQPlaylist(id, cookie, logf)
+		case KindAlbum:
+			return fetchQQAlbum(id, cookie, logf)
+		case KindSinger:
+			return fetchQQSinger(id, 30, cookie, logf)
 		}
 		songs, err := fetchQQSong(id, cookie, logf)
 		return "单曲", songs, err
@@ -80,6 +87,17 @@ func downloadSongs(songs []*Song, dir string, logf func(string)) (okCount, skipC
 		}
 		filename := filepath.Join(dir, sanitizeFilename(s.Name+"-"+s.Artist)+"."+ext)
 
+		// 已存在且大小与接口一致 -> 跳过重下(断点续传).
+		if s.Size > 0 {
+			if fi, err := os.Stat(filename); err == nil && fi.Size() == s.Size {
+				logf(fmt.Sprintf("↻ 已存在跳过 [%s - %s] %.2fMB", s.Name, s.Artist, float64(fi.Size())/(1024*1024)))
+				mu.Lock()
+				skipCount++
+				mu.Unlock()
+				continue
+			}
+		}
+
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(s *Song, filename string) {
@@ -87,7 +105,7 @@ func downloadSongs(songs []*Song, dir string, logf func(string)) (okCount, skipC
 				<-sem
 				wg.Done()
 			}()
-			written, err := downloadFile(s.URL, filename)
+			written, err := downloadFile(s.URL, filename, s.Size)
 			if err != nil {
 				logf(fmt.Sprintf("下载失败 [%s - %s]: %v", s.Name, s.Artist, err))
 				return
@@ -117,7 +135,7 @@ func sanitizeFilename(name string) string {
 }
 
 // downloadFile 下载 url 到 dst, 返回写入字节数.
-func downloadFile(url, dst string) (int64, error) {
+func downloadFile(url, dst string, expected int64) (int64, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return 0, err
@@ -130,19 +148,35 @@ func downloadFile(url, dst string) (int64, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("HTTP 状态码 %d", resp.StatusCode)
+		return 0, fmt.Errorf("HTTP \u72b6\u6001\u7801 %d", resp.StatusCode)
 	}
 
-	f, err := os.Create(dst)
+	// \u5148\u5199\u5165 .part \u4e34\u65f6\u6587\u4ef6, \u5b8c\u6210\u5e76\u6821\u9a8c\u540e\u518d\u539f\u5b50\u91cd\u547d\u540d, \u907f\u514d\u4e2d\u65ad\u4ea7\u751f\u635f\u574f\u6587\u4ef6.
+	tmp := dst + ".part"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
 
 	written, err := io.Copy(f, resp.Body)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
 	if err != nil {
-		f.Close()
-		os.Remove(dst)
+		os.Remove(tmp)
+		return 0, err
+	}
+
+	// \u5927\u5c0f\u6821\u9a8c: \u82e5\u63a5\u53e3\u7ed9\u4e86\u9884\u671f\u5927\u5c0f\u4e14\u4e0d\u4e00\u81f4, \u5224\u4e3a\u4e0b\u8f7d\u4e0d\u5b8c\u6574.
+	if expected > 0 && written != expected {
+		os.Remove(tmp)
+		return 0, fmt.Errorf("\u4e0b\u8f7d\u4e0d\u5b8c\u6574: \u5b9e\u9645 %d \u5b57\u8282, \u9884\u671f %d \u5b57\u8282", written, expected)
+	}
+
+	// \u76ee\u6807\u5df2\u5b58\u5728\u65f6\u5148\u5220\u9664, \u4fdd\u8bc1 rename \u6210\u529f(Windows).
+	os.Remove(dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
 		return 0, err
 	}
 	return written, nil
